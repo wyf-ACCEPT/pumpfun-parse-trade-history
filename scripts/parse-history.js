@@ -4,7 +4,25 @@ const { Connection, PublicKey, VersionedTransactionResponse } = require('@solana
 
 const batchSize = 20;
 const connection = new Connection(process.env.SOLANA_RPC);
-const PUMPFUN_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+const PUMPFUN_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+
+const RESET = '\x1b[0m';
+const RED = '\x1b[31m';
+const GREEN = '\x1b[32m';
+const YELLOW = '\x1b[33m';
+const BLUE = '\x1b[34m';
+const PURPLE = '\x1b[35m';
+
+/**
+ * @typedef {Object} PumpfunTxResult
+ * @property {string} solAmount
+ * @property {string} tokenAmount
+ * @property {boolean} isBuy
+ * @property {number} timestamp
+ * @property {number} slot
+ * @property {string} signature
+ * @property {boolean} success
+ */
 
 /**
  * Fetches signatures for a given address for a given number of days
@@ -72,23 +90,40 @@ function isPumpfunTx(tx) {
 /**
  * Parse a pumpfun transaction
  * @param {VersionedTransactionResponse} tx
- * @returns {Object}
+ * @returns {{ PumpfunTxResult }}
  */
 function parsePumpfunTx(tx) {
   for (const innerInst of tx.meta?.innerInstructions ?? []) {
     for (const instruction of innerInst.instructions) {
       if (instruction.programId.equals(PUMPFUN_PROGRAM_ID)) {
         const encoded = bs58.decode(instruction.data)
+        const mint = new PublicKey(bs58.encode(Buffer.from(encoded.slice(16, 48), 'hex')))
         const solAmount = Buffer.from(encoded.slice(48, 56)).readBigInt64LE().toString()
         const tokenAmount = Buffer.from(encoded.slice(56, 64)).readBigInt64LE().toString()
         const isBuy = encoded[64] == 1
+        const timestamp = Buffer.from(encoded.slice(97, 105)).readBigInt64LE().toString()
         return {
-          solAmount, tokenAmount, isBuy,
+          mint, solAmount, tokenAmount, isBuy, timestamp,
+          slot: tx.slot, signature: tx.transaction.signatures[0], success: tx.meta?.err === null,
         }
       }
     }
   }
+}
 
+/**
+ * Show a pumpfun transaction
+ * @param {PumpfunTxResult} parsedTx
+ */
+function showPumpfunTx(parsedTx) {
+  const time = (new Date(parseInt(parsedTx.timestamp) * 1e3)).toISOString().slice(0, 19).replace('T', ' ')
+  if (parsedTx.isBuy) {
+    console.log(`[${YELLOW}${time}${RESET}] Buy ${BLUE}${(parsedTx.solAmount / 1e9).toFixed(5)} $SOL${RESET} ` +
+      `-> ${GREEN}${(parsedTx.tokenAmount / 1e6).toFixed(2)}${RESET} Token[${parsedTx.mint.toString()}]`)
+  } else {
+    console.log(`[${YELLOW}${time}${RESET}] Sell ${RED}${(parsedTx.tokenAmount / 1e6).toFixed(2)}${RESET} Token[${parsedTx.mint.toString()}] ` +
+      `-> ${BLUE}${(parsedTx.solAmount / 1e9).toFixed(5)} $SOL${RESET}`)
+  }
 }
 
 /**
@@ -112,14 +147,9 @@ async function getTransactionDetails(signatures) {
           .then(tx => {
             const pumpfunTxType = isPumpfunTx(tx);
             if (pumpfunTxType != 0) {
-              parsePumpfunTx(tx);
-              transactions.push({
-                signature: sig.signature,
-                timestamp: tx.blockTime,
-                slot: tx.slot,
-                success: tx.meta?.err === null,
-                ...parsePumpfunTx(tx),
-              });
+              const parsed = parsePumpfunTx(tx);
+              showPumpfunTx(parsed);
+              transactions.push(parsed);
             }
           })
           .catch(error => {
@@ -157,16 +187,6 @@ async function getAllTransactions(address, daysAgo) {
   }
 }
 
-// connection.getParsedTransaction(
-//   "me1B1ZRr1SqBsAqmhMjqa5hxYtg5hERZ7Pn7zcC1WGQH8UPgfFh78GpZL7XRhVbQk3VXoNAKxWqth3NZiqc8ik1",
-//   { maxSupportedTransactionVersion: 0 }
-// )
-//   .then(tx => {
-//     console.log(tx)
-//     console.log(isPumpfunTx(tx))
-//   })
-//   .catch(console.error);
-
 
 const walletAddress = 'Gv4mQWaPiWbwXiNT7JtHYN6LuBVbFoKHhDiNYcEVGbdM';
 
@@ -175,7 +195,7 @@ getAllTransactions(walletAddress, 7)
     console.log(`Transactions: ${data.pumpfunCount} pumpfun, ${data.txCount} total.`);
     const fs = require('fs');
     fs.writeFileSync(
-      'transactions.json',
+      './data/transactions.json',
       JSON.stringify(data.transactions, null, 2)
     );
   })
