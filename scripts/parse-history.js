@@ -1,9 +1,12 @@
 require('dotenv').config();
 const bs58 = require('bs58').default;
+const LRU = require('lru-cache');
+const { Metaplex } = require('@metaplex-foundation/js')
 const { Connection, PublicKey, VersionedTransactionResponse } = require('@solana/web3.js');
 
 const batchSize = 20;
 const connection = new Connection(process.env.SOLANA_RPC);
+const metaplex = Metaplex.make(connection);
 const PUMPFUN_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
 const RESET = '\x1b[0m';
@@ -12,6 +15,9 @@ const GREEN = '\x1b[32m';
 const YELLOW = '\x1b[33m';
 const BLUE = '\x1b[34m';
 const PURPLE = '\x1b[35m';
+const GRAY = '\x1b[90m';
+
+const tokenNameCache = {}
 
 /**
  * @typedef {Object} PumpfunTxResult
@@ -35,7 +41,6 @@ async function getSignatures(address, daysAgo) {
   const startTime = Math.floor(Date.now() / 1000) - (daysAgo * 24 * 60 * 60);
 
   try {
-    console.log(`Fetching signatures for the last ${daysAgo} days...`);
     let signatures = [];
     let before = undefined;
 
@@ -74,6 +79,7 @@ async function getSignatures(address, daysAgo) {
  */
 function isPumpfunTx(tx) {
   if (
+    tx.transaction &&
     tx.transaction.message.instructions &&
     tx.transaction.message.instructions.some(
       instruction => instruction.programId &&
@@ -88,23 +94,42 @@ function isPumpfunTx(tx) {
 }
 
 /**
+ * Get the name of a token
+ * @param {PublicKey} mint 
+ * @returns {Promise<string>}
+ */
+async function nameOfToken(mint) {
+  const key = mint.toString();
+  const cached = tokenNameCache[key];
+  if (cached) return cached;
+  const metadata = await metaplex.nfts().findByMint({ mintAddress: mint });
+  let name = metadata.name;
+  if (name.includes(' ')) name = `"${name}"`
+  tokenNameCache[key] = name;
+  return name;
+}
+
+/**
  * Parse a pumpfun transaction
  * @param {VersionedTransactionResponse} tx
  * @returns {{ PumpfunTxResult }}
  */
-function parsePumpfunTx(tx) {
+async function parsePumpfunTx(tx) {
   for (const innerInst of tx.meta?.innerInstructions ?? []) {
     for (const instruction of innerInst.instructions) {
       if (instruction.programId.equals(PUMPFUN_PROGRAM_ID)) {
         const encoded = bs58.decode(instruction.data)
+        if (encoded.length != 137) continue;
         const mint = new PublicKey(bs58.encode(Buffer.from(encoded.slice(16, 48), 'hex')))
         const solAmount = Buffer.from(encoded.slice(48, 56)).readBigInt64LE().toString()
         const tokenAmount = Buffer.from(encoded.slice(56, 64)).readBigInt64LE().toString()
         const isBuy = encoded[64] == 1
         const timestamp = Buffer.from(encoded.slice(97, 105)).readBigInt64LE().toString()
+        const tokenName = await nameOfToken(mint);
         return {
           mint, solAmount, tokenAmount, isBuy, timestamp,
           slot: tx.slot, signature: tx.transaction.signatures[0], success: tx.meta?.err === null,
+          tokenName,
         }
       }
     }
@@ -119,10 +144,12 @@ function showPumpfunTx(parsedTx) {
   const time = (new Date(parseInt(parsedTx.timestamp) * 1e3)).toISOString().slice(0, 19).replace('T', ' ')
   if (parsedTx.isBuy) {
     console.log(`[${YELLOW}${time}${RESET}] Buy ${BLUE}${(parsedTx.solAmount / 1e9).toFixed(5)} $SOL${RESET} ` +
-      `-> ${GREEN}${(parsedTx.tokenAmount / 1e6).toFixed(2)}${RESET} Token[${parsedTx.mint.toString()}]`)
+      `-> ${GREEN}${(parsedTx.tokenAmount / 1e6).toFixed(2)} $${parsedTx.tokenName}${RESET}` + 
+      `  ${GRAY}https://solscan.io/tx/${parsedTx.signature}${RESET}`)
   } else {
-    console.log(`[${YELLOW}${time}${RESET}] Sell ${RED}${(parsedTx.tokenAmount / 1e6).toFixed(2)}${RESET} Token[${parsedTx.mint.toString()}] ` +
-      `-> ${BLUE}${(parsedTx.solAmount / 1e9).toFixed(5)} $SOL${RESET}`)
+    console.log(`[${YELLOW}${time}${RESET}] Sell ${RED}${(parsedTx.tokenAmount / 1e6).toFixed(2)} $${parsedTx.tokenName}${RESET} ` +
+      `-> ${BLUE}${(parsedTx.solAmount / 1e9).toFixed(5)} $SOL${RESET}` + 
+      `  ${GRAY}https://solscan.io/tx/${parsedTx.signature}${RESET}`)
   }
 }
 
@@ -132,7 +159,7 @@ function showPumpfunTx(parsedTx) {
  * @returns {Promise<Transaction[]>}
  */
 async function getTransactionDetails(signatures) {
-  console.log('Fetching transaction details...');
+  console.log('\nFetching transaction details...');
   const transactions = [];
   const inProgress = new Set();
   let completed = 0;
@@ -147,9 +174,11 @@ async function getTransactionDetails(signatures) {
           .then(tx => {
             const pumpfunTxType = isPumpfunTx(tx);
             if (pumpfunTxType != 0) {
-              const parsed = parsePumpfunTx(tx);
-              showPumpfunTx(parsed);
-              transactions.push(parsed);
+              parsePumpfunTx(tx)
+                .then(parsed => {
+                  showPumpfunTx(parsed);
+                  transactions.push(parsed);
+                })
             }
           })
           .catch(error => {
@@ -158,8 +187,8 @@ async function getTransactionDetails(signatures) {
           .finally(() => {
             inProgress.delete(promise);
             completed++;
-            if (completed % batchSize === 0)
-              console.log(`Processed ${completed}/${signatures.length} transactions`);
+            // if (completed % batchSize === 0)
+            //   console.log(`Processed ${completed}/${signatures.length} transactions`);
             startNext();
             if (completed === signatures.length)
               resolve({
@@ -176,9 +205,10 @@ async function getTransactionDetails(signatures) {
 }
 
 async function getAllTransactions(address, daysAgo) {
+  console.log(`\nFetching transactions for ${PURPLE}${address}${RESET} in the last ${YELLOW}${daysAgo}${RESET} days...\n`);
   try {
     const signatures = await getSignatures(address, daysAgo);
-    console.log(`Total signatures found: ${signatures.length}`);
+    console.log(`\nTotal signatures found: ${PURPLE}${signatures.length}${RESET}.`);
     if (signatures.length === 0) return [];
     return await getTransactionDetails(signatures);
   } catch (error) {
@@ -190,7 +220,7 @@ async function getAllTransactions(address, daysAgo) {
 
 const walletAddress = 'Gv4mQWaPiWbwXiNT7JtHYN6LuBVbFoKHhDiNYcEVGbdM';
 
-getAllTransactions(walletAddress, 7)
+getAllTransactions(walletAddress, 10)
   .then(data => {
     console.log(`Transactions: ${data.pumpfunCount} pumpfun, ${data.txCount} total.`);
     const fs = require('fs');
